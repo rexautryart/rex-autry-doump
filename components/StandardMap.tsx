@@ -10,7 +10,7 @@ const X_MAX = 0.5 * (Math.PI * Math.cos(PHI_1) + Math.PI) // ≈ 2.571
 const Y_MAX = Math.PI / 2                                   // ≈ 1.5708
 const MIN_ZOOM = 1
 const MAX_ZOOM = 50
-const PAD_CSS = 40 // padding in CSS pixels — scaled to physical inside draw
+const PAD_CSS  = 40  // logical padding in CSS px — multiplied by dpr inside draw
 
 function projectWT(lon: number, lat: number): [number, number] {
   const lam = (lon * Math.PI) / 180
@@ -65,24 +65,19 @@ function getLonExtent(geom: any): [number, number] {
   return [min === Infinity ? -180 : min, max === -Infinity ? 180 : max]
 }
 
-// ─── Mouse → physical canvas pixel coordinate ────────────────────────────────
-// canvas.width is physical pixels; rect.width is CSS pixels.
-// Ratio = devicePixelRatio. Ensures zoom/pan math is in the same
-// coordinate space as the canvas drawing operations.
+// ─── CSS → physical canvas pixel coordinate ──────────────────────────────────
 function getCursorCanvasPos(
   e: { clientX: number; clientY: number },
   canvas: HTMLCanvasElement,
 ) {
   const rect = canvas.getBoundingClientRect()
-  const scaleX = canvas.width  / rect.width
-  const scaleY = canvas.height / rect.height
   return {
-    x: (e.clientX - rect.left) * scaleX,
-    y: (e.clientY - rect.top)  * scaleY,
+    x: (e.clientX - rect.left) * (canvas.width  / rect.width),
+    y: (e.clientY - rect.top)  * (canvas.height / rect.height),
   }
 }
 
-// ─── GeoJSON path tracing ─────────────────────────────────────────────────────
+// ─── GeoJSON path tracing with optional point simplification ──────────────────
 type ToCanvasFn = (lon: number, lat: number) => [number, number]
 
 function makeToCanvas(scale: number, cx: number, cy: number): ToCanvasFn {
@@ -92,38 +87,52 @@ function makeToCanvas(scale: number, cx: number, cy: number): ToCanvasFn {
   }
 }
 
-function traceRing(ctx: any, ring: number[][], toCanvas: ToCanvasFn, close: boolean) {
+// minDist > 0 skips projected points closer than minDist physical pixels to
+// the previous accepted point. Used at low zoom to reduce draw call count.
+function traceRing(
+  ctx: any,
+  ring: number[][],
+  toCanvas: ToCanvasFn,
+  close: boolean,
+  minDist = 0,
+) {
   const norm = normalizeRing(ring)
+  let px = 0, py = 0, started = false
   for (let i = 0; i < norm.length; i++) {
     const lat = Math.max(-85, Math.min(85, norm[i][1]))
     const [sx, sy] = toCanvas(norm[i][0], lat)
-    if (i === 0) ctx.moveTo(sx, sy)
-    else ctx.lineTo(sx, sy)
+    if (!started) {
+      ctx.moveTo(sx, sy); px = sx; py = sy; started = true
+    } else {
+      if (minDist > 0 && i < norm.length - 1) {
+        const dx = sx - px, dy = sy - py
+        if (dx * dx + dy * dy <= minDist * minDist) continue
+      }
+      ctx.lineTo(sx, sy); px = sx; py = sy
+    }
   }
   if (close) ctx.closePath()
 }
 
-function traceGeomParts(ctx: any, geom: any, toCanvas: ToCanvasFn) {
+function traceGeomParts(ctx: any, geom: any, toCanvas: ToCanvasFn, minDist = 0) {
   if (!geom) return
   switch (geom.type) {
     case 'Polygon':
-      for (const r of geom.coordinates) traceRing(ctx, r, toCanvas, true); break
+      for (const r of geom.coordinates) traceRing(ctx, r, toCanvas, true, minDist); break
     case 'MultiPolygon':
       for (const poly of geom.coordinates)
-        for (const r of poly) traceRing(ctx, r, toCanvas, true)
+        for (const r of poly) traceRing(ctx, r, toCanvas, true, minDist)
       break
     case 'MultiLineString':
-      for (const l of geom.coordinates) traceRing(ctx, l, toCanvas, false); break
+      for (const l of geom.coordinates) traceRing(ctx, l, toCanvas, false, minDist); break
     case 'LineString':
-      traceRing(ctx, geom.coordinates, toCanvas, false); break
+      traceRing(ctx, geom.coordinates, toCanvas, false, minDist); break
     case 'GeometryCollection':
-      for (const g of (geom.geometries ?? [])) traceGeomParts(ctx, g, toCanvas); break
+      for (const g of (geom.geometries ?? [])) traceGeomParts(ctx, g, toCanvas, minDist); break
   }
 }
 
-// ─── Pure base-layer draw ─────────────────────────────────────────────────────
-// All coordinates are physical canvas pixels (canvas.width / canvas.height).
-// ctx must have identity transform (no setTransform scaling).
+// ─── Static base-layer draw (called only on offscreen rebuilds) ───────────────
 interface CountryMeta {
   id: number; name: string
   centroid: [number, number] | null
@@ -132,15 +141,16 @@ interface CountryMeta {
 
 function drawBaseLayer(
   ctx: any,
-  W: number, H: number,          // physical canvas pixels
+  W: number, H: number,
   scale: number, cx: number, cy: number,
   curZoom: number,
-  isDark: boolean,
-  dpr: number,
+  isDark: boolean, dpr: number,
   land: any, borders: any, states: any,
   countries: CountryMeta[],
 ) {
   const toCanvas = makeToCanvas(scale, cx, cy)
+  // At low zoom, skip points that project within minDist physical px of previous.
+  const minDist = Math.max(1, 3 / curZoom)
 
   ctx.fillStyle = isDark ? '#0d1b2a' : '#e8f0f8'
   ctx.fillRect(0, 0, W, H)
@@ -149,9 +159,9 @@ function drawBaseLayer(
     ctx.fillStyle = isDark ? '#1e3a1e' : '#d4e4c8'
     ctx.beginPath()
     if (land.type === 'FeatureCollection') {
-      for (const f of land.features) traceGeomParts(ctx, f.geometry, toCanvas)
+      for (const f of land.features) traceGeomParts(ctx, f.geometry, toCanvas, minDist)
     } else {
-      traceGeomParts(ctx, land.geometry, toCanvas)
+      traceGeomParts(ctx, land.geometry, toCanvas, minDist)
     }
     ctx.fill('evenodd')
   }
@@ -160,7 +170,7 @@ function drawBaseLayer(
     ctx.strokeStyle = isDark ? '#1a3a1a' : '#c0d0b0'
     ctx.lineWidth = 0.3 * dpr
     ctx.beginPath()
-    traceGeomParts(ctx, states, toCanvas)
+    traceGeomParts(ctx, states, toCanvas, minDist)
     ctx.stroke()
   }
 
@@ -168,7 +178,7 @@ function drawBaseLayer(
     ctx.strokeStyle = isDark ? '#2a4a2a' : '#a0b890'
     ctx.lineWidth = (curZoom > 10 ? Math.min(2, curZoom * 0.08) : 0.5) * dpr
     ctx.beginPath()
-    traceGeomParts(ctx, borders, toCanvas)
+    traceGeomParts(ctx, borders, toCanvas, minDist)
     ctx.stroke()
   }
 
@@ -244,13 +254,9 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef    = useRef<HTMLCanvasElement>(null)
 
-  // ── View: physical canvas pixel coords throughout ─────────────────────────
-  // zoomRef and panRef are in PHYSICAL pixels (canvas.width / canvas.height).
-  // getCursorCanvasPos() scales all mouse events to physical pixels to match.
+  // ── View state — physical canvas pixels throughout ────────────────────────
   const zoomRef = useRef(MIN_ZOOM)
   const panRef  = useRef({ x: 0, y: 0 })
-
-  // Prop mirrors — always fresh without useCallback deps
   const darkModeRef = useRef(darkMode)
   darkModeRef.current = darkMode
   const samplesRef = useRef(samples)
@@ -259,8 +265,17 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
   // ── RAF / wheel accumulator ───────────────────────────────────────────────
   const rafId             = useRef(0)
   const pendingZoomFactor = useRef(1)
-  const pendingZoomMx     = useRef(0) // physical pixels
+  const pendingZoomMx     = useRef(0)
   const pendingZoomMy     = useRef(0)
+
+  // ── Two-layer offscreen refs ──────────────────────────────────────────────
+  // Layer 1: static base (ocean, land, borders, labels) in offscreenRef.
+  // Built once per debounce period; composited via drawImage offset for pan.
+  const offscreenRef  = useRef<OffscreenCanvas | null>(null)
+  const baseOxRef     = useRef(0)   // panRef.x when offscreen was built
+  const baseOyRef     = useRef(0)   // panRef.y when offscreen was built
+  const baseZoomRef   = useRef(MIN_ZOOM) // zoom when offscreen was built
+  const rebuildTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // ── Topology refs ─────────────────────────────────────────────────────────
   const land110      = useRef<any>(null)
@@ -277,14 +292,13 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
   const statesRef    = useRef<any>(null)
   const loadingStates = useRef(false)
   const loadedStates  = useRef(false)
-  const offscreenRef  = useRef<OffscreenCanvas | null>(null)
 
-  // ── Hover / interaction ───────────────────────────────────────────────────
-  const hoveredRef      = useRef<DoumpSample | null>(null)
-  const isDragging      = useRef(false)
-  const hasMoved        = useRef(false)
-  const lastDragX       = useRef(0) // CSS pixels for delta
-  const lastDragY       = useRef(0)
+  // ── Hover / drag ──────────────────────────────────────────────────────────
+  const hoveredRef  = useRef<DoumpSample | null>(null)
+  const isDragging  = useRef(false)
+  const hasMoved    = useRef(false)
+  const lastDragX   = useRef(0)
+  const lastDragY   = useRef(0)
 
   // ── React state — only for lazy-fetch triggers ────────────────────────────
   const [topoLoaded, setTopoLoaded]                   = useState(false)
@@ -300,63 +314,57 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
     return { land: land110.current, borders: borders110.current }
   }
 
-  // ── Build offscreen + composite ───────────────────────────────────────────
-  const buildOffscreenAndDraw = () => {
+  // ── Layer 1: build static base into offscreen canvas ─────────────────────
+  // Expensive — only called when content actually changes, via scheduleRebuild.
+  const buildOffscreen = () => {
     const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    if (!canvas || !topoLoadedRef.current) return
 
     const dpr = window.devicePixelRatio || 1
-    // Use physical canvas pixels as the drawing coordinate space.
-    // ctx has identity transform — no setTransform(dpr) needed.
-    const W = canvas.width   // physical pixels
-    const H = canvas.height  // physical pixels
+    const W   = canvas.width
+    const H   = canvas.height
     if (!W || !H) return
 
-    ctx.setTransform(1, 0, 0, 1, 0, 0) // identity — we work in physical pixels
+    if (typeof OffscreenCanvas === 'undefined') return
 
-    if (!topoLoadedRef.current) {
-      ctx.fillStyle = darkModeRef.current ? '#0d1b2a' : '#e8f0f8'
-      ctx.fillRect(0, 0, W, H)
-      return
+    if (!offscreenRef.current || offscreenRef.current.width !== W || offscreenRef.current.height !== H) {
+      offscreenRef.current = new OffscreenCanvas(W, H)
     }
 
-    const PAD = PAD_CSS * dpr  // physical pixels
-    const baseScale = Math.min(
-      (W - 2 * PAD) / (2 * X_MAX),
-      (H - 2 * PAD) / (2 * Y_MAX),
-    )
-    const curZoom = zoomRef.current
-    const scale   = baseScale * curZoom
-    const cx = W / 2 + panRef.current.x  // physical pixels
+    const octx = offscreenRef.current.getContext('2d')
+    if (!octx) return
+
+    const PAD = PAD_CSS * dpr
+    const baseScale = Math.min((W - 2*PAD) / (2*X_MAX), (H - 2*PAD) / (2*Y_MAX))
+    const scale = baseScale * zoomRef.current
+    const cx = W / 2 + panRef.current.x
     const cy = H / 2 + panRef.current.y
     const { land, borders } = getActiveTopo()
 
-    // Rebuild offscreen at same physical dimensions
-    if (typeof OffscreenCanvas !== 'undefined') {
-      if (!offscreenRef.current ||
-          offscreenRef.current.width !== W ||
-          offscreenRef.current.height !== H) {
-        offscreenRef.current = new OffscreenCanvas(W, H)
-      }
-      const octx = offscreenRef.current.getContext('2d')
-      if (octx) {
-        octx.setTransform(1, 0, 0, 1, 0, 0)
-        drawBaseLayer(octx, W, H, scale, cx, cy, curZoom,
-          darkModeRef.current, dpr, land, borders, statesRef.current, countriesRef.current)
-        ctx.drawImage(offscreenRef.current, 0, 0)
-      }
-    } else {
-      drawBaseLayer(ctx, W, H, scale, cx, cy, curZoom,
-        darkModeRef.current, dpr, land, borders, statesRef.current, countriesRef.current)
-    }
+    octx.setTransform(1, 0, 0, 1, 0, 0)
+    drawBaseLayer(octx, W, H, scale, cx, cy, zoomRef.current,
+      darkModeRef.current, dpr, land, borders, statesRef.current, countriesRef.current)
 
-    // Pins (physical pixel coords)
+    // Record the pan/zoom state at which this offscreen was built
+    baseOxRef.current   = panRef.current.x
+    baseOyRef.current   = panRef.current.y
+    baseZoomRef.current = zoomRef.current
+  }
+
+  // ── Layer 2: draw dynamic overlay (pins + tooltip) ────────────────────────
+  // Cheap — always redrawn from current zoom/pan refs.
+  const drawPinsAndTooltip = (ctx: CanvasRenderingContext2D, W: number, H: number) => {
+    const dpr = window.devicePixelRatio || 1
+    const PAD = PAD_CSS * dpr
+    const baseScale = Math.min((W - 2*PAD) / (2*X_MAX), (H - 2*PAD) / (2*Y_MAX))
+    const scale = baseScale * zoomRef.current
+    const cx = W / 2 + panRef.current.x
+    const cy = H / 2 + panRef.current.y
     const toCanvas = makeToCanvas(scale, cx, cy)
-    const pinR     = 6  * dpr
-    const pinRHov  = 9  * dpr
-    const strokeW  = 1.5 * dpr
+
+    const pinR    = 6   * dpr
+    const pinRHov = 9   * dpr
+    const strokeW = 1.5 * dpr
     for (const s of samplesRef.current) {
       const [sx, sy] = toCanvas(s.coordinates[0], s.coordinates[1])
       const r = hoveredRef.current?.id === s.id ? pinRHov : pinR
@@ -369,65 +377,138 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
       ctx.stroke()
     }
 
-    // Tooltip
     const hs = hoveredRef.current
-    if (hs) {
-      const [sx, sy] = toCanvas(hs.coordinates[0], hs.coordinates[1])
-      const PT = 10 * dpr, LH = 16 * dpr, offset = 14 * dpr
-      const lines = [hs.name, hs.location, hs.dateCollected]
-      ctx.font = `bold ${11 * dpr}px monospace`
-      const tw = Math.max(...lines.map(l => ctx.measureText(l).width)) + PT * 2
-      const th = LH * lines.length + PT * 2
-      let tx = sx + offset, ty = sy - th / 2
-      if (tx + tw > W) tx = sx - tw - offset
-      if (ty < 4) ty = 4
-      if (ty + th > H - 4) ty = H - th - 4
+    if (!hs) return
+    const [sx, sy] = toCanvas(hs.coordinates[0], hs.coordinates[1])
+    const PT = 10 * dpr, LH = 16 * dpr, offset = 14 * dpr
+    const lines = [hs.name, hs.location, hs.dateCollected]
+    ctx.font = `bold ${11 * dpr}px monospace`
+    const tw = Math.max(...lines.map(l => ctx.measureText(l).width)) + PT * 2
+    const th = LH * lines.length + PT * 2
+    let tx = sx + offset, ty = sy - th / 2
+    if (tx + tw > W) tx = sx - tw - offset
+    if (ty < 4) ty = 4
+    if (ty + th > H - 4) ty = H - th - 4
 
-      ctx.save()
-      ctx.shadowColor = 'rgba(0,0,0,0.18)'; ctx.shadowBlur = 10 * dpr
-      ctx.shadowOffsetX = 2 * dpr; ctx.shadowOffsetY = 3 * dpr
-      ctx.fillStyle = darkModeRef.current ? '#1a1a1a' : '#ffffff'
-      const rr = 2 * dpr
-      ctx.beginPath()
-      ctx.moveTo(tx + rr, ty); ctx.lineTo(tx + tw - rr, ty)
-      ctx.arcTo(tx + tw, ty, tx + tw, ty + rr, rr)
-      ctx.lineTo(tx + tw, ty + th - rr)
-      ctx.arcTo(tx + tw, ty + th, tx + tw - rr, ty + th, rr)
-      ctx.lineTo(tx + rr, ty + th)
-      ctx.arcTo(tx, ty + th, tx, ty + th - rr, rr)
-      ctx.lineTo(tx, ty + rr)
-      ctx.arcTo(tx, ty, tx + rr, ty, rr)
-      ctx.closePath(); ctx.fill()
-      ctx.restore()
-      lines.forEach((line, i) => {
-        ctx.font = i === 0 ? `bold ${11 * dpr}px monospace` : `${11 * dpr}px monospace`
-        ctx.fillStyle = i === 0
-          ? (darkModeRef.current ? '#e8e8e8' : '#111')
-          : (darkModeRef.current ? '#888' : '#666')
-        ctx.fillText(line, tx + PT, ty + PT + LH * i + 11 * dpr)
-      })
-    }
+    ctx.save()
+    ctx.shadowColor = 'rgba(0,0,0,0.18)'; ctx.shadowBlur = 10 * dpr
+    ctx.shadowOffsetX = 2 * dpr; ctx.shadowOffsetY = 3 * dpr
+    ctx.fillStyle = darkModeRef.current ? '#1a1a1a' : '#ffffff'
+    const rr = 2 * dpr
+    ctx.beginPath()
+    ctx.moveTo(tx+rr, ty); ctx.lineTo(tx+tw-rr, ty)
+    ctx.arcTo(tx+tw, ty, tx+tw, ty+rr, rr)
+    ctx.lineTo(tx+tw, ty+th-rr)
+    ctx.arcTo(tx+tw, ty+th, tx+tw-rr, ty+th, rr)
+    ctx.lineTo(tx+rr, ty+th)
+    ctx.arcTo(tx, ty+th, tx, ty+th-rr, rr)
+    ctx.lineTo(tx, ty+rr)
+    ctx.arcTo(tx, ty, tx+rr, ty, rr)
+    ctx.closePath(); ctx.fill()
+    ctx.restore()
+    lines.forEach((line, i) => {
+      ctx.font = i === 0 ? `bold ${11*dpr}px monospace` : `${11*dpr}px monospace`
+      ctx.fillStyle = i === 0
+        ? (darkModeRef.current ? '#e8e8e8' : '#111')
+        : (darkModeRef.current ? '#888' : '#666')
+      ctx.fillText(line, tx + PT, ty + PT + LH * i + 11 * dpr)
+    })
   }
 
-  // ── RAF scheduler ─────────────────────────────────────────────────────────
+  // ── drawFrame: composite layers onto main canvas ──────────────────────────
+  // Called every RAF. Fast path: blit offscreen with pan delta + draw pins.
+  const drawFrame = () => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const W = canvas.width, H = canvas.height
+    if (!W || !H) return
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+
+    if (!topoLoadedRef.current) {
+      ctx.fillStyle = darkModeRef.current ? '#0d1b2a' : '#e8f0f8'
+      ctx.fillRect(0, 0, W, H)
+      drawPinsAndTooltip(ctx, W, H)
+      return
+    }
+
+    const ocean = darkModeRef.current ? '#0d1b2a' : '#e8f0f8'
+
+    if (!offscreenRef.current) {
+      // No offscreen yet (first frame or after resize) — draw base directly once
+      const dpr = window.devicePixelRatio || 1
+      const PAD = PAD_CSS * dpr
+      const baseScale = Math.min((W-2*PAD)/(2*X_MAX), (H-2*PAD)/(2*Y_MAX))
+      const scale = baseScale * zoomRef.current
+      const cx = W/2 + panRef.current.x
+      const cy = H/2 + panRef.current.y
+      const { land, borders } = getActiveTopo()
+      drawBaseLayer(ctx, W, H, scale, cx, cy, zoomRef.current,
+        darkModeRef.current, dpr, land, borders, statesRef.current, countriesRef.current)
+    } else {
+      // Compute delta between current view and the view the offscreen was built for
+      const dx = panRef.current.x - baseOxRef.current
+      const dy = panRef.current.y - baseOyRef.current
+      const zoomRatio = zoomRef.current / baseZoomRef.current
+
+      // Fill background first so pan-exposed edges show ocean, not black
+      ctx.fillStyle = ocean
+      ctx.fillRect(0, 0, W, H)
+
+      if (Math.abs(zoomRatio - 1) < 0.02) {
+        // Pure pan — free: just blit with pixel offset
+        ctx.drawImage(offscreenRef.current, dx, dy)
+      } else {
+        // Active zoom — scale the cached base as approximation.
+        // After 200ms settle, scheduleRebuild fires and redraws exactly.
+        // The zoom center in screen space is where the cursor is, which
+        // corresponds to (W/2 + dx, H/2 + dy) relative to offscreen center.
+        ctx.save()
+        ctx.translate(W / 2 + dx, H / 2 + dy)
+        ctx.scale(zoomRatio, zoomRatio)
+        ctx.translate(-W / 2, -H / 2)
+        ctx.drawImage(offscreenRef.current, 0, 0)
+        ctx.restore()
+      }
+    }
+
+    drawPinsAndTooltip(ctx, W, H)
+  }
+  const drawFrameRef = useRef(drawFrame)
+  drawFrameRef.current = drawFrame
+
+  // ── scheduleRebuild: deferred high-quality base rebuild ───────────────────
+  // Debounced 200ms after the last call. Rebuilds offscreen then redraws.
+  // Pass delay=0 for immediate rebuild (resize, dark mode, new topo data).
+  const scheduleRebuild = (delay = 200) => {
+    if (rebuildTimerRef.current) clearTimeout(rebuildTimerRef.current)
+    rebuildTimerRef.current = setTimeout(() => {
+      rebuildTimerRef.current = null
+      buildOffscreen()
+      drawFrameRef.current()
+    }, delay)
+  }
+  const scheduleRebuildRef = useRef(scheduleRebuild)
+  scheduleRebuildRef.current = scheduleRebuild
+
+  // ── scheduleDraw: RAF-batched frame composite (cheap, every interaction) ──
   const scheduleDraw = () => {
     if (rafId.current) cancelAnimationFrame(rafId.current)
     rafId.current = requestAnimationFrame(() => {
       rafId.current = 0
-      // Apply accumulated wheel zoom (all in physical pixels)
+      // Apply accumulated wheel zoom (one shot, eliminates FP drift)
       if (pendingZoomFactor.current !== 1) {
         const factor = pendingZoomFactor.current
         pendingZoomFactor.current = 1
         const canvas = canvasRef.current
         if (canvas) {
-          const W   = canvas.width
-          const H   = canvas.height
-          const mx  = pendingZoomMx.current
-          const my  = pendingZoomMy.current
+          const W = canvas.width, H = canvas.height
+          const mx = pendingZoomMx.current
+          const my = pendingZoomMy.current
           const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomRef.current * factor))
           const af  = newZoom / zoomRef.current
-          // Correct zoom-around-cursor: anchor = (mx - W/2, my - H/2)
-          // so that the geographic point under the cursor stays fixed.
           const mxc = mx - W / 2
           const myc = my - H / 2
           panRef.current = {
@@ -437,24 +518,23 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
           zoomRef.current = newZoom
           setZoomForThresholds(newZoom)
         }
+        // Defer quality rebuild until zoom settles
+        scheduleRebuildRef.current(200)
       }
-      buildOffscreenAndDraw()
+      drawFrameRef.current()
     })
   }
-
   const scheduleDrawRef = useRef(scheduleDraw)
   scheduleDrawRef.current = scheduleDraw
 
-  // ── doZoomAt: zoom around a physical-pixel cursor position ────────────────
+  // ── doZoomAt: precise cursor-centered zoom (double-click + keyboard) ──────
   const doZoomAt = (mx: number, my: number, factor: number) => {
     const canvas = canvasRef.current
     if (!canvas) return
-    const W      = canvas.width
-    const H      = canvas.height
+    const W = canvas.width, H = canvas.height
     const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomRef.current * factor))
-    const af      = newZoom / zoomRef.current
-    const mxc = mx - W / 2
-    const myc = my - H / 2
+    const af = newZoom / zoomRef.current
+    const mxc = mx - W / 2, myc = my - H / 2
     panRef.current = {
       x: mxc - af * (mxc - panRef.current.x),
       y: myc - af * (myc - panRef.current.y),
@@ -462,6 +542,7 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
     zoomRef.current = newZoom
     setZoomForThresholds(newZoom)
     scheduleDraw()
+    scheduleRebuildRef.current(200)
   }
   const doZoomAtRef = useRef(doZoomAt)
   doZoomAtRef.current = doZoomAt
@@ -521,7 +602,10 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
     }
   }, [zoomForThresholds])
 
-  useEffect(() => { scheduleDrawRef.current() }, [topoLoaded, extraLoaded, darkMode])
+  // New topo / dark mode: rebuild immediately (delay=0), then frame
+  useEffect(() => {
+    scheduleRebuildRef.current(0)
+  }, [topoLoaded, extraLoaded, darkMode])
 
   // ── Resize observer ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -532,14 +616,12 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
       const dpr = window.devicePixelRatio || 1
       const W   = container.clientWidth
       const H   = Math.round(W * 0.56)
-      // CSS display size
       canvas.style.width  = `${W}px`
       canvas.style.height = `${H}px`
-      // Physical pixel size — canvas.width used as drawing coordinate system
       canvas.width  = W * dpr
       canvas.height = H * dpr
-      offscreenRef.current = null
-      scheduleDrawRef.current()
+      offscreenRef.current = null // size changed — must rebuild
+      scheduleRebuildRef.current(0)
     }
     const ro = new ResizeObserver(update)
     ro.observe(container)
@@ -547,14 +629,13 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
     return () => ro.disconnect()
   }, [])
 
-  // ── Native wheel listener ─────────────────────────────────────────────────
+  // ── Native wheel (passive:false) ──────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
       const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12
-      // Scale to physical canvas pixels
       const pos = getCursorCanvasPos(e, canvas)
       pendingZoomMx.current      = pos.x
       pendingZoomMy.current      = pos.y
@@ -570,7 +651,6 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
     const onKey = (e: KeyboardEvent) => {
       const canvas = canvasRef.current
       if (!canvas) return
-      // Physical center of canvas
       if (e.key === '+' || e.key === '=')
         doZoomAtRef.current(canvas.width / 2, canvas.height / 2, 1.3)
       else if (e.key === '-')
@@ -580,23 +660,18 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  // ── Hit test (physical pixels) ────────────────────────────────────────────
+  // ── Hit test ──────────────────────────────────────────────────────────────
   const getSampleAtPos = (posX: number, posY: number): DoumpSample | null => {
     const canvas = canvasRef.current
     if (!canvas) return null
     const dpr  = window.devicePixelRatio || 1
-    const W    = canvas.width
-    const H    = canvas.height
+    const W    = canvas.width, H = canvas.height
     const PAD  = PAD_CSS * dpr
-    const baseScale = Math.min((W - 2 * PAD) / (2 * X_MAX), (H - 2 * PAD) / (2 * Y_MAX))
-    const toCanvas  = makeToCanvas(
-      baseScale * zoomRef.current,
-      W / 2 + panRef.current.x,
-      H / 2 + panRef.current.y,
-    )
+    const base = Math.min((W-2*PAD)/(2*X_MAX), (H-2*PAD)/(2*Y_MAX))
+    const tc   = makeToCanvas(base * zoomRef.current, W/2 + panRef.current.x, H/2 + panRef.current.y)
     const hitR = 12 * dpr
     for (const s of samplesRef.current) {
-      const [sx, sy] = toCanvas(s.coordinates[0], s.coordinates[1])
+      const [sx, sy] = tc(s.coordinates[0], s.coordinates[1])
       if (Math.hypot(posX - sx, posY - sy) <= hitR) return s
     }
     return null
@@ -614,21 +689,17 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
   const handleMouseMove = (e: React.MouseEvent) => {
     const canvas = canvasRef.current
     if (!canvas) return
-
     if (isDragging.current) {
       const dpr = window.devicePixelRatio || 1
-      const dx  = (e.clientX - lastDragX.current) * dpr  // CSS delta → physical
+      const dx  = (e.clientX - lastDragX.current) * dpr
       const dy  = (e.clientY - lastDragY.current) * dpr
       if (Math.abs(dx) > 2 || Math.abs(dy) > 2) hasMoved.current = true
-      panRef.current = {
-        x: panRef.current.x + dx,
-        y: panRef.current.y + dy,
-      }
+      panRef.current = { x: panRef.current.x + dx, y: panRef.current.y + dy }
       lastDragX.current = e.clientX
       lastDragY.current = e.clientY
       scheduleDrawRef.current()
+      scheduleRebuildRef.current(200) // rebuild after drag settles
     } else {
-      // Hit test in physical pixels
       const pos = getCursorCanvasPos(e, canvas)
       const hit = getSampleAtPos(pos.x, pos.y)
       if (hit?.id !== hoveredRef.current?.id) {
@@ -651,10 +722,7 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
   }
 
   const handleMouseLeave = () => {
-    if (hoveredRef.current) {
-      hoveredRef.current = null
-      scheduleDrawRef.current()
-    }
+    if (hoveredRef.current) { hoveredRef.current = null; scheduleDrawRef.current() }
     isDragging.current = false
     if (canvasRef.current) canvasRef.current.style.cursor = 'grab'
   }
@@ -677,7 +745,6 @@ export default function StandardMap({ samples, onSelectSample, darkMode = false 
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseLeave}
         onDoubleClick={handleDblClick}
-        // wheel handled via native addEventListener (passive:false)
       />
     </div>
   )
