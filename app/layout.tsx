@@ -3,7 +3,7 @@ import './globals.css'
 
 export const metadata: Metadata = {
   title: 'D.O.U.M.P. — Dirt Of Universal Mysterious Provenance',
-  description: 'A multigenerational dirt sample collection by Rex Autry / Tyrannographics.',
+  description: 'A multigenerational dirt sample collection. Museum archive view.',
 }
 
 export default function RootLayout({
